@@ -1,21 +1,40 @@
+from engine import train_one_epoch, evaluate
+
 import argparse
 import os
-import numpy as np
-import random
-import math
-import sys
 import time
+import sys
+
+import numpy as np
+
+from PIL import Image
 
 import torch
 import torch.utils.data
+from torch import nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim import lr_scheduler
+
 import torchvision
-import torchvision.models.detection.mask_rcnn
+from torchvision import transforms
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
-from torchvision.transforms import functional as F
+
+
+# local deps
+import utils
+import transforms as T
 
 
 
+# constants
+MODEL_SAVEFILE = 'instance-seg'
+
+
+
+##################################################
+## DATASET
 
 class PennFudanDataset(torch.utils.data.Dataset):
     def __init__(self, root, transforms=None):
@@ -82,85 +101,26 @@ class PennFudanDataset(torch.utils.data.Dataset):
 
     def __len__(self):
         return len(self.imgs)
-    
-    
-
-##################################################
-## HELPERS FROM transforms.py
-
-def _flip_coco_person_keypoints(kps, width):
-    flip_inds = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
-    flipped_data = kps[:, flip_inds]
-    flipped_data[..., 0] = width - flipped_data[..., 0]
-    # Maintain COCO convention that if visibility == 0, then x, y = 0
-    inds = flipped_data[..., 2] == 0
-    flipped_data[inds] = 0
-    return flipped_data
-
-
-class Compose(object):
-    def __init__(self, transforms):
-        self.transforms = transforms
-
-    def __call__(self, image, target):
-        for t in self.transforms:
-            image, target = t(image, target)
-        return image, target
-
-
-class RandomHorizontalFlip(object):
-    def __init__(self, prob):
-        self.prob = prob
-
-    def __call__(self, image, target):
-        if random.random() < self.prob:
-            height, width = image.shape[-2:]
-            image = image.flip(-1)
-            bbox = target["boxes"]
-            bbox[:, [0, 2]] = width - bbox[:, [2, 0]]
-            target["boxes"] = bbox
-            if "masks" in target:
-                target["masks"] = target["masks"].flip(-1)
-            if "keypoints" in target:
-                keypoints = target["keypoints"]
-                keypoints = _flip_coco_person_keypoints(keypoints, width)
-                target["keypoints"] = keypoints
-        return image, target
-
-
-class ToTensor(object):
-    def __call__(self, image, target):
-        image = F.to_tensor(image)
-        return image, target
-
-def get_transform(train):
-    transforms = []
-    # converts the image, a PIL image, into a PyTorch Tensor
-    transforms.append(ToTensor())
-    if train:
-        # during training, randomly flip the training images
-        # and ground-truth for data augmentation
-        transforms.append(RandomHorizontalFlip(0.5))
-    return Compose(transforms)
 
 
 
-##################################################
-## HELPERS FROM utils.py
-
-def collate_fn(batch):
-    return tuple(zip(*batch))
-
-
-##################################################
-## GENERIC HELPERS
-
+# generic helpers
 def tlog(msg):
     print('{}   {}'.format(time.asctime(), msg))
 
-def get_instance_segmentation_model(num_classes):
+
+def save_model(model, model_dir):
+    tlog('Saving model')
+    savefile = 'model.pt'
+    path = os.path.join(model_dir, savefile)
+    # recommended way from https://pytorch.org/docs/stable/notes/serialization.html
+    torch.save(model.state_dict(), path)
+    return savefile
+      
+    
+def get_instance_segmentation_model(num_classes, pre_trained=True):
     # load an instance segmentation model pre-trained on COCO
-    model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=True)
+    model = torchvision.models.detection.maskrcnn_resnet50_fpn(pretrained=pre_trained)
 
     # get the number of input features for the classifier
     in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -178,25 +138,49 @@ def get_instance_segmentation_model(num_classes):
     return model
 
 
+def get_transform(train):
+    transforms = []
+    # converts the image, a PIL image, into a PyTorch Tensor
+    transforms.append(T.ToTensor())
+    if train:
+        # during training, randomly flip the training images
+        # and ground-truth for data augmentation
+        transforms.append(T.RandomHorizontalFlip(0.5))
+    return T.Compose(transforms)
+
 
 ##################################################
 ## TRAINING LOOP
-##################################################
 
-def train(training_model, n_epochs, optim, scheduler, model_dir, dev, train_loader, test_loader):
+def train(training_model, n_epochs, optim, lr_scheduler, model_dir, target_device, train_loader, test_loader):
     tlog('Training the model...')
-    tlog('working on {}'.format(device))
-    for epoch in range(num_epochs):
+    tlog('working on {}'.format(target_device))
+    
+    best_accuracy = 0. # determines whether we save a copy of the model
+    saved_model_filename = None
+    
+    for epoch in range(n_epochs):
         # train for one epoch, printing every 10 iterations
-        train_one_epoch(model, optimizer, data_loader, device, epoch, print_freq=10)
+        train_one_epoch(training_model, optim, train_loader, target_device, epoch, print_freq=10)
         # update the learning rate
-        scheduler.step()
+        lr_scheduler.step()
         # evaluate on the test dataset
-        evaluate(model, data_loader_test, device=device)
+        x = evaluate(training_model, test_loader, device=target_device)
+        print(x)
     
-    # TODO check acc and set aside best
-    # TODO return best and acc
-    
+    saved_model_filename = save_model(training_model, args.model_dir)
+    return (saved_model_filename, 1)
+
+
+##################################################
+## FOR PREDICTION
+def model_fn(model_dir):
+    model = get_instance_segmentation_model(2, pre_trained=False)
+    with open(os.path.join(model_dir, 'model.pt'), 'rb') as f:
+        model.load_state_dict(torch.load(f, map_location='cpu'))
+    return model
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
@@ -204,7 +188,6 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--learning-rate', type=float, default=0.005)
-    parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--use-cuda', type=bool, default=True)
 
     # Data, model, and output directories
@@ -216,15 +199,15 @@ if __name__ == '__main__':
     print(args)
 
     if args.use_cuda and torch.cuda.is_available():
-        device = torch.device('cuda')
+        dev = torch.device('cuda')
         print('GPU ready to go!')
     else:
-        device = torch.device('cpu')
+        dev = torch.device('cpu')
         print('*** GPU not available - running on CPU. ***')
 
     # use our dataset and defined transformations
-    dataset = PennFudanDataset('PennFudanPed', get_transform(train=True))
-    dataset_test = PennFudanDataset('PennFudanPed', get_transform(train=False))
+    dataset = PennFudanDataset('/opt/ml/input/data/training', get_transform(train=True)) # /PennFudanPed
+    dataset_test = PennFudanDataset('/opt/ml/input/data/training', get_transform(train=False))
 
     # split the dataset in train and test set
     torch.manual_seed(1)
@@ -234,20 +217,22 @@ if __name__ == '__main__':
 
     # define training and validation data loaders
     data_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, num_workers=4,
-        collate_fn=collate_fn)
+        dataset, batch_size=args.batch_size, shuffle=True, num_workers=1,
+        collate_fn=utils.collate_fn)
     data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=1, shuffle=False, num_workers=4,
-        collate_fn=collate_fn)
+        dataset_test, batch_size=1, shuffle=False, num_workers=1,
+        collate_fn=utils.collate_fn)
 
-    # get the model using our helper function & move to correct device
-    model = get_instance_segmentation_model(num_classes)
-    model.to(device)
+    # get the model using our helper function
+    # our dataset has two classes only - background and person
+    model = get_instance_segmentation_model(2)
+    # move model to the right device
+    model.to(dev)
 
     # construct an optimizer
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.learning_rate,
-                                momentum=args.momentum, weight_decay=0.0005)
+                                momentum=0.9, weight_decay=0.0005)
 
     # and a learning rate scheduler which decreases the learning rate by
     # 10x every 3 epochs
@@ -255,5 +240,5 @@ if __name__ == '__main__':
                                                    step_size=3,
                                                    gamma=0.1)
 
-    best_model, acc = train(model, args.epochs, optimizer, lr_scheduler, args.model_dir, device, data_loader, data_loader_test)
-    
+    best_model, acc = train(model, args.epochs, optimizer, lr_scheduler, args.model_dir, dev, data_loader, data_loader_test)
+

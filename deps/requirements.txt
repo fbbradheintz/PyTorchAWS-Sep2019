@@ -1,0 +1,5 @@
+numpy
+Cython==0.28.2
+torch==1.1.0
+torchvision==0.3.0
+pycocotools-fix==2.0.0.1
